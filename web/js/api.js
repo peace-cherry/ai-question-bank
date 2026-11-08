@@ -82,23 +82,23 @@ const API = (() => {
   }
 
   /** 判断异常是否属于「接口尚未实现」——例如 chat 接口还没上线时的 404 */
-  function isNotImplemented(err) {
-    if (!err) return false;
-    /* 优先按 HTTP 状态码判断，比匹配错误文案可靠：
-     *   404 接口不存在 / 405 方法不允许 / 501 服务端未实现该方法
-     * 注意不含 500：那是后端真实故障，必须暴露出来，不能被演示数据掩盖。 */
-    if (err.status === 404 || err.status === 405 || err.status === 501) {
-      return true;
-    }
-    const msg = String(err.message || '');
-    return msg.indexOf('api not found') !== -1 ||
-           msg.indexOf('404') !== -1 ||
-           msg.indexOf('405') !== -1 ||
-           msg.indexOf('501') !== -1 ||
-           msg.indexOf('Not Found') !== -1 ||
-           msg.indexOf('method not allowed') !== -1 ||
-           msg.indexOf('Unsupported method') !== -1;
-  }
+ function isNotImplemented(err) {
+   if (!err) return false;
+   /* 优先按 HTTP 状态码判断，比匹配错误文案可靠：
+    *   404 接口不存在 / 405 方法不允许 / 501 服务端未实现该方法
+    * 注意不含 500：那是后端真实故障，必须暴露出来，不能被演示数据掩盖。 */
+   if (err.status === 404 || err.status === 405 || err.status === 501) {
+     return true;
+   }
+   const msg = String(err.message || '');
+   return msg.indexOf('api not found') !== -1 ||
+          msg.indexOf('404') !== -1 ||
+          msg.indexOf('405') !== -1 ||
+          msg.indexOf('501') !== -1 ||
+          msg.indexOf('Not Found') !== -1 ||
+          msg.indexOf('method not allowed') !== -1 ||
+          msg.indexOf('Unsupported method') !== -1;
+ }
 
   /** 通用 fetch 封装 */
   async function request(method, path, body) {
@@ -275,6 +275,48 @@ const API = (() => {
     });
   }
 
+  /* 离线注册：校验规则与 docs/auth.md 2.1 的 400/409 契约保持一致。
+   * 注册成功写回 MOCK_USERS，保证离线模式下新账号可以立即登录。 */
+  function mockRegister(payload) {
+    return delay(400).then(() => {
+      const username = String(payload.username || '').trim();
+      const password = String(payload.password || '');
+      const confirm = String(payload.confirm_password || '');
+      const role = String(payload.role || 'student');
+
+      if (!username) {
+        throw new Error('用户名不能为空');
+      }
+      if (password !== confirm) {
+        throw new Error('两次输入的密码不一致');
+      }
+      if (password.length < 8 || !/[A-Za-z]/.test(password) || !/[0-9]/.test(password)) {
+        throw new Error('密码至少 8 位，且必须包含字母和数字');
+      }
+      if (['student', 'teacher', 'admin'].indexOf(role) === -1) {
+        throw new Error('角色值无效，仅支持 student/teacher/admin');
+      }
+      if (MOCK_USERS.filter((u) => u.username === username).length > 0) {
+        const err = new Error('用户名已存在');
+        err.status = 409;
+        throw err;
+      }
+
+      const user = {
+        id: MOCK_USERS.length + 1,
+        username: username,
+        name: username,
+        role: role,
+        password: password
+      };
+      MOCK_USERS.push(user);
+      return {
+        token: 'demo-offline-token-' + Date.now(),
+        user: { id: user.id, username: user.username, name: user.name, role: user.role }
+      };
+    });
+  }
+
   function mockQuestions() {
     return delay(300).then(() => ({ questions: MOCK_QUESTIONS.slice() }));
   }
@@ -291,13 +333,22 @@ const API = (() => {
     });
   }
 
-  function mockChat(questionId, message) {
-    return delay(800).then(() => {
-      const reply = MOCK_REPLIES[questionId] ||
-        '这是题目 ' + questionId + ' 的解答（演示模式）。\n\n' +
-        '你的问题：' + message + '\n\n' +
-        '后端对话接口尚未就绪，当前为前端内置的模拟回复。';
-      return { reply: reply };
+  function mockChat(questionId, message, { mode, onStatus } = {}) {
+    const modeLabel = { solve: '完整讲解', hint: '分层提示', review: '错因分析' }[mode] || '完整讲解';
+    return delay(1200).then(() => {
+      const base = MOCK_REPLIES[questionId] ||
+        `这是题目 ${questionId} 的解答（演示模式）。\n\n你的问题：${message}\n\n后端对话接口尚未就绪，当前为前端内置的模拟回复。`;
+      const created = {
+        job_id: '00000000-0000-0000-0000-000000000000',
+        conversation_id: '00000000-0000-0000-0000-000000000001',
+        question_id: questionId,
+        mode: mode || 'solve',
+        status: 'succeeded',
+        reply: base + '\n\n【演示模式】教学模式：' + modeLabel,
+        model: 'mock'
+      };
+      if (typeof onStatus === 'function') onStatus(created);
+      return created;
     });
   }
 
@@ -334,6 +385,22 @@ const API = (() => {
       );
     },
 
+    /** 注册 POST /auth/register（成功即自动登录，返回 token + user） */
+    register(username, password, confirmPassword, role) {
+      const payload = {
+        username: username,
+        password: password,
+        confirm_password: confirmPassword
+      };
+      if (role) {
+        payload.role = role;
+      }
+      return withFallback(
+        () => request('POST', '/auth/register', payload),
+        () => mockRegister(payload)
+      );
+    },
+
     /** 退出 POST /auth/logout（离线模式直接成功，本地状态由调用方清除） */
     logout() {
       return withFallback(
@@ -360,11 +427,26 @@ const API = (() => {
       );
     },
 
-    /** 发送对话 POST /chat（后端尚未实现，自动回退演示数据） */
-    chat(questionId, message) {
+    /** 查询 AI 使用权限 GET /ai/access（v1.2）
+     * 后端返回 { ai_access: {...} }，这里提取内部对象 */
+    aiAccess() {
       return withFallback(
-        () => request('POST', '/chat', { question_id: questionId, message: message }),
-        () => mockChat(questionId, message),
+        () => request('GET', '/ai/access').then((body) => body.ai_access || {}),
+        () => delay(150).then(() => ({ status: 'active', allowed: true, expires_at: null }))
+      );
+    },
+
+    /** 发送对话 POST /chat（v1.2 异步任务，自动轮询）
+     * opts: { questionId, message, conversationId, mode, studentAnswer, onStatus, signal } */
+    chat(opts) {
+      const { questionId, message, conversationId, mode, studentAnswer, onStatus, signal } = opts || {};
+      return withFallback(
+        () => PiChatClient.sendPiChat({
+          questionId, message, conversationId, token: getToken(),
+          mode, studentAnswer, onStatus,
+          signal
+        }),
+        () => mockChat(questionId, message, { mode, onStatus }),
         () => { chatMocked = true; }
       );
     }

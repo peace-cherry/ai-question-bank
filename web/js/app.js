@@ -10,6 +10,13 @@ function navigate(hash) {
 function route() {
   const hash = window.location.hash || '#login';
 
+  /* 注册页只在 #register 下显示，其余路由统一隐藏 */
+  $('page-register').classList.add('hidden');
+  if (hash === '#register') {
+    RegisterPage.show();
+    return;
+  }
+
   // 检查是否已登录
   const token = API.getToken();
 
@@ -44,15 +51,35 @@ window.app = {
     return AuthPage.handleLogin(e);
   },
 
+  register(e) {
+    return RegisterPage.handleRegister(e);
+  },
+
   logout() {
     // 尝试调用后端退出 API，然后清除本地状态
-    API.logout().catch(() => {});
+    API.logout().catch((err) => {
+      console.warn('[APP] 登出请求失败：', err);
+    });
     API.clearAuth();
+    /* 切换用户必须清空会话映射，避免复用上一个用户的 conversation_id */
+    ChatPage.resetConversations();
     navigate('#login');
   },
 
   sendChat() {
     ChatPage.sendMessage();
+  },
+
+  cancelChat() {
+    ChatPage.cancel();
+  },
+
+  reloadQuestions() {
+    QuestionsPage.reload();
+  },
+
+  retryDetail() {
+    ChatPage.retryDetail();
   },
 
   navigate

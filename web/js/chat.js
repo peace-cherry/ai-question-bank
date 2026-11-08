@@ -1,22 +1,94 @@
-/* ── 对话页（题目详情 + AI 对话） ── */
+/* ── 对话页（题目详情 + AI 对话） ──
+ *
+ * 接入 Pi Agent v1.2 异步任务：
+ *   - 进入页面时查询 AI 授权状态（GET /api/v1/ai/access）
+ *   - 发送时 POST /api/v1/chat 得到 job_id，轮询 GET /api/v1/chat/{job_id}
+ *   - 支持取消（DELETE /api/v1/chat/{job_id}）
+ *   - 支持追问：同一题目同一模式下复用 conversation_id
+ *   - 支持三种模式：solve / hint / review
+ */
 const ChatPage = (() => {
   const $ = (id) => document.getElementById(id);
   let currentQuestionId = null;
+  let currentMode = 'solve';
   let chatMockNoticeShown = false;
 
-  /** HTML 转义：AI 回复属于不可信内容，插入 innerHTML 前必须先转义，
-   *  否则后端返回的 <script> / <img onerror=...> 会被浏览器执行（XSS）。
-   *  这也是 CONTRIBUTING.md 审查清单中「注入」一项的要求。 */
-  function escapeHtml(s) {
-    return String(s)
-      .replace(/&/g, '&amp;')
-      .replace(/</g, '&lt;')
-      .replace(/>/g, '&gt;')
-      .replace(/"/g, '&quot;')
-      .replace(/'/g, '&#39;');
+  /* conversation_id 按 "题目 + 模式" 隔离保存，支持同题追问 */
+  const conversations = new Map();
+
+  /* 当前正在进行的任务控制器 */
+  let activeController = null;
+  let activeJobId = null;
+
+  /* AI 权限状态 */
+  let aiAccess = null;
+
+  /* ── UI 辅助 ── */
+  function getModeLabel(mode) {
+    return { solve: '完整讲解', hint: '分层提示', review: '错因分析' }[mode] || mode;
   }
 
+  function setSendEnabled(enabled) {
+    $('chatSendBtn').disabled = !enabled;
+  }
+
+  function setCancelVisible(visible) {
+    const btn = $('chatCancelBtn');
+    if (visible) btn.classList.remove('hidden');
+    else btn.classList.add('hidden');
+  }
+
+  function setInputsEnabled(enabled) {
+    $('chatInput').disabled = !enabled;
+    $('chatMode').disabled = !enabled;
+    $('studentAnswerInput').disabled = !enabled;
+  }
+
+  function renderAiAccess() {
+    const el = $('aiAccessStatus');
+    if (!aiAccess) {
+      el.classList.add('hidden');
+      return;
+    }
+    el.classList.remove('hidden');
+    const statusMap = {
+      active: { cls: 'status-active', text: 'AI 权限已启用' },
+      not_granted: { cls: 'status-denied', text: '尚未获得 AI 使用权限，请联系平台负责人' },
+      revoked: { cls: 'status-denied', text: 'AI 使用权限已撤销，请联系平台负责人' },
+      expired: { cls: 'status-denied', text: 'AI 使用权限已到期，请联系平台负责人' },
+    };
+    const info = statusMap[aiAccess.status] || { cls: 'status-denied', text: 'AI 权限状态未知' };
+    el.className = 'ai-access-status ' + info.cls;
+    let text = info.text;
+    if (aiAccess.expires_at) {
+      text += '（到期：' + aiAccess.expires_at + '）';
+    }
+    el.textContent = text;
+  }
+
+  async function refreshAiAccess(silent) {
+    try {
+      aiAccess = await API.aiAccess();
+    } catch (e) {
+      if (!silent) {
+        addMessage('system', 'AI 权限查询失败：' + (e.message || '未知错误'));
+      }
+      aiAccess = { status: 'not_granted', allowed: false, expires_at: null };
+    }
+    renderAiAccess();
+    setSendEnabled(aiAccess.allowed || API.isOfflineDemo());
+    return aiAccess;
+  }
+
+  /* ── 页面生命周期 ── */
   function show(questionId) {
+    /* 切题前先中止上一个活动任务：否则迟到的成功回调会把回复追加到新题目
+     * 的聊天区，并把 conversation_id 写进新题目的会话键。 */
+    if (activeController) {
+      activeController.abort();
+      activeController = null;
+      activeJobId = null;
+    }
     currentQuestionId = parseInt(questionId, 10);
     $('page-login').classList.add('hidden');
     $('navbar').classList.remove('hidden');
@@ -27,22 +99,34 @@ const ChatPage = (() => {
     $('chatMessages').innerHTML = '';
     chatMockNoticeShown = false;
     $('chatInput').value = '';
+    $('studentAnswerInput').value = '';
     $('detailLoading').classList.remove('hidden');
     $('detailError').classList.add('hidden');
     $('detailContent').classList.add('hidden');
+    $('aiAccessStatus').classList.add('hidden');
+    setCancelVisible(false);
+    /* 旧任务被 abort 后不会走 finally 恢复 UI，这里必须重新放开输入态，
+     * 否则「提问后立刻切题」会让新题的输入框一直禁用。 */
+    setInputsEnabled(true);
 
-    // 更新用户信息
+    // 默认模式
+    currentMode = 'solve';
+    $('chatMode').value = currentMode;
+    syncReviewInput();
+
     updateUserInfo();
-
     loadQuestionDetail(currentQuestionId);
 
-    // 加个欢迎消息
+    // 欢迎消息
     addMessage('system', '请在下方输入你的问题，AI 将为你解答这道题。');
 
-    /* 离线演示时明确告知，避免把前端内置演示数据误当成真实后端 / 真实 AI 展示 */
+    /* 离线演示时明确告知 */
     if (typeof API !== 'undefined' && API.isOfflineDemo && API.isOfflineDemo()) {
       addMessage('system', '⚠ 离线演示模式：数据来自前端内置演示集，未连接后端，回复不是真实 AI 生成。');
     }
+
+    // 查询 AI 权限（非阻塞）
+    refreshAiAccess(true);
   }
 
   function updateUserInfo() {
@@ -51,14 +135,18 @@ const ChatPage = (() => {
   }
 
   async function loadQuestionDetail(id) {
+    /* 重试时先复位到加载态 */
+    $('detailError').classList.add('hidden');
+    $('detailContent').classList.add('hidden');
+    $('detailLoading').classList.remove('hidden');
     try {
-      const data = await API.questionDetail(id);  // { question: {...} }
+      const data = await API.questionDetail(id);
       const q = data.question;
       renderDetail(q);
       $('chatQuestionTitle').textContent = '题目 #' + q.id;
     } catch (e) {
       $('detailLoading').classList.add('hidden');
-      $('detailError').textContent = '加载题目失败：' + (e.message || '未知错误');
+      $('detailErrorText').textContent = '加载题目失败：' + (e.message || '未知错误');
       $('detailError').classList.remove('hidden');
     }
   }
@@ -73,10 +161,10 @@ const ChatPage = (() => {
     const optsEl = $('qOptions');
     if (Array.isArray(q.options) && q.options.length > 0) {
       optsEl.innerHTML = q.options.map(opt =>
-        `<div class="q-opt-item"><span class="q-opt-label">${opt.label}.</span>${opt.text}</div>`
+        `<div class="q-opt-item"><span class="q-opt-label">${escapeHtml(opt.label)}.</span>${escapeHtml(opt.text)}</div>`
       ).join('');
     } else {
-      optsEl.innerHTML = '<p style="color:#999;font-size:13px;">（本题为简答/填空类型，无选项）</p>';
+      optsEl.innerHTML = '<p class="q-opt-empty">（本题为简答/填空类型，无选项）</p>';
     }
 
     // 类型标签
@@ -92,32 +180,160 @@ const ChatPage = (() => {
     $('qAnalysis').textContent = q.analysis || '（暂无）';
   }
 
+  /* ── 模式切换 ── */
+  function onModeChange() {
+    const newMode = $('chatMode').value;
+    if (newMode === currentMode) return;
+    currentMode = newMode;
+    syncReviewInput();
+    // 切换模式建立新对话
+    addMessage('system', '已切换为「' + getModeLabel(currentMode) + '」模式，将开启新对话。');
+  }
+
+  function syncReviewInput() {
+    const input = $('studentAnswerInput');
+    if (currentMode === 'review') {
+      input.classList.remove('hidden');
+    } else {
+      input.classList.add('hidden');
+    }
+  }
+
+  /* ── 对话管理 ── */
+  function getConversationKey() {
+    return currentQuestionId + ':' + currentMode;
+  }
+
+  /* key 可显式传入：异步回调里必须用发送时的快照键，不能用当前页面的键 */
+  function setConversationId(id, key) {
+    conversations.set(key || getConversationKey(), id);
+  }
+
+  /** 登出 / 切换用户时清空会话映射，避免复用上一个用户的 conversation_id */
+  function resetConversations() {
+    conversations.clear();
+    currentQuestionId = null;
+    currentMode = 'solve';
+    if (activeController) {
+      activeController.abort();
+      activeController = null;
+      activeJobId = null;
+    }
+  }
+
+  /* ── 发送消息 ── */
   async function sendMessage() {
     const input = $('chatInput');
     const text = input.value.trim();
     if (!text || !currentQuestionId) return;
 
-    input.value = '';
-    addMessage('user', text);
+    if (!aiAccess || !aiAccess.allowed) {
+      await refreshAiAccess(false);
+      if (!aiAccess || !aiAccess.allowed) {
+        addMessage('system', '当前无法使用 AI 解答，请先申请 AI 使用权限。');
+        return;
+      }
+    }
 
-    // 显示加载中
-    const loadingId = addMessage('loading', 'AI 思考中...');
+    const studentAnswer = currentMode === 'review' ? $('studentAnswerInput').value.trim() : undefined;
+    if (currentMode === 'review' && !studentAnswer) {
+      addMessage('system', '错因分析模式需要填写你的作答或过程。');
+      return;
+    }
+
+    input.value = '';
+    if (currentMode === 'review') $('studentAnswerInput').value = '';
+    addMessage('user', text + (studentAnswer ? '\n（我的作答：' + studentAnswer + '）' : ''));
+
+    const loadingId = addMessage('loading', 'AI 正在排队...');
+    setSendEnabled(false);
+    setInputsEnabled(false);
+    setCancelVisible(true);
+
+    /* 快照本次请求所属的题目/模式/会话键，供异步回调写回时使用 */
+    const askedQuestionId = currentQuestionId;
+    const askedMode = currentMode;
+    const conversationKey = getConversationKey();
+    const conversationId = conversations.get(conversationKey) || null;
+
+    const myController = new AbortController();
+    activeController = myController;
 
     try {
-      const data = await API.chat(currentQuestionId, text);
-      // 移除 loading，添加回复
-      removeMessage(loadingId);
-      addMessage('ai', data.reply || '（无回复）');
+      const result = await API.chat({
+        questionId: askedQuestionId,
+        message: text,
+        conversationId: conversationId,
+        mode: askedMode,
+        studentAnswer: studentAnswer,
+        signal: myController.signal,
+        onStatus: (job) => {
+          updateLoadingText(loadingId, job);
+        }
+      });
 
-      /* 无论 file:// 还是服务器上的 http://，只要后端 chat 接口没就绪就会
-       * 静默回退到内置数据。这里补一条提示，避免把演示数据当成真实 AI 输出。 */
+      /* 任务已被切题/登出中止：丢弃迟到结果，不污染当前页面 */
+      if (activeController !== myController) return;
+
+      removeMessage(loadingId);
+      addMessage('ai', result.reply || '（无回复）');
+
+      if (result.conversation_id) {
+        setConversationId(result.conversation_id, conversationKey);
+      }
+
       if (!chatMockNoticeShown && API.isChatMocked && API.isChatMocked()) {
         chatMockNoticeShown = true;
         addMessage('system', '⚠ 上面这条回复来自前端内置演示数据：后端 /api/v1/chat 尚未实现，不是真实 AI 生成。');
       }
     } catch (e) {
+      if (activeController !== myController) return;
       removeMessage(loadingId);
-      addMessage('system', '对话失败：' + (e.message || '未知错误'));
+      handleChatError(e, text, studentAnswer);
+    } finally {
+      /* 只有当前任务仍是自己时才恢复 UI，避免覆盖新任务的禁用状态 */
+      if (activeController === myController) {
+        activeController = null;
+        activeJobId = null;
+        setSendEnabled(true);
+        setInputsEnabled(true);
+        setCancelVisible(false);
+      }
+    }
+  }
+
+  function updateLoadingText(loadingId, job) {
+    const el = document.getElementById(loadingId);
+    if (!el) return;
+    const statusMap = {
+      queued: 'AI 正在排队...',
+      running: 'AI 正在解答...',
+      succeeded: '解答完成',
+      failed: '解答失败',
+      cancelled: '已取消'
+    };
+    el.textContent = statusMap[job.status] || 'AI 处理中...';
+    activeJobId = job.job_id || activeJobId;
+  }
+
+  function handleChatError(e, text, studentAnswer) {
+    let message = e.message || '未知错误';
+    if (e.code === 'AI_ACCESS_REQUIRED' || e.code === 'AI_ACCESS_REVOKED' || e.code === 'AI_ACCESS_EXPIRED') {
+      message = 'AI 权限不足：' + message + '。请刷新权限或联系平台负责人。';
+      refreshAiAccess(true);
+    } else if (e.code === 'CLIENT_CANCELLED') {
+      message = '已取消解答。';
+    } else if (e.code === 'CLIENT_TIMEOUT') {
+      message = '等待解答超时，请稍后重试。';
+    } else if (e.status === 401 || e.code === 'UNAUTHORIZED') {
+      message = '登录已过期，请重新登录。';
+    }
+    addMessage('system', '对话失败：' + message);
+  }
+
+  function cancel() {
+    if (activeController) {
+      activeController.abort();
     }
   }
 
@@ -128,9 +344,7 @@ const ChatPage = (() => {
     const el = document.createElement('div');
     el.id = id;
     el.className = 'msg msg-' + type;
-    /* textContent 由浏览器自动转义，本身安全 */
     el.textContent = text;
-    /* AI 回复需要保留换行：必须先转义、再把 \n 换成 <br>，顺序不能颠倒 */
     if (type === 'ai') {
       el.innerHTML = escapeHtml(text).replace(/\n/g, '<br>');
     }
@@ -144,5 +358,22 @@ const ChatPage = (() => {
     if (el) el.remove();
   }
 
-  return { show, sendMessage };
+  return {
+    show,
+    sendMessage,
+    cancel,
+    onModeChange,
+    retryDetail: () => loadQuestionDetail(currentQuestionId),
+    resetConversations
+  };
 })();
+
+/* 模式切换事件 */
+document.addEventListener('DOMContentLoaded', () => {
+  const modeSelect = document.getElementById('chatMode');
+  if (modeSelect) {
+    modeSelect.addEventListener('change', () => {
+      ChatPage.onModeChange && ChatPage.onModeChange();
+    });
+  }
+});

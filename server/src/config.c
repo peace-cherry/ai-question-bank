@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
 
 #include "config.h"
 
@@ -49,15 +50,44 @@ static const char *env_or(const char *key, const char *fallback) {
     return (v != NULL && v[0] != '\0') ? v : fallback;
 }
 
+/* 禁止0（libcurl表示不限时）、负数、溢出和尾随垃圾；日志不输出原始值。 */
+static long timeout_ms(const char *key, long fallback) {
+    const char *value = getenv(key);
+    if (value == NULL || value[0] == '\0') return fallback;
+    for (const char *p = value; *p != '\0'; p++) {
+        if (*p < '0' || *p > '9') goto invalid;
+    }
+    errno = 0;
+    char *end;
+    long parsed = strtol(value, &end, 10);
+    if (errno == 0 && *end == '\0' && parsed >= 1 && parsed <= AI_SERVICE_TIMEOUT_MS_MAX) return parsed;
+invalid:
+    fprintf(stderr, "[config] invalid %s; using default %ld ms (allowed 1-%ld)\n",
+            key, fallback, AI_SERVICE_TIMEOUT_MS_MAX);
+    return fallback;
+}
+
 AppConfig config_load(void) {
-    load_env_file();
-    AppConfig cfg;
+    const char *skip_env = getenv("AQB_SKIP_ENV_FILE");
+    if (skip_env == NULL || strcmp(skip_env, "1") != 0) load_env_file();
+    AppConfig cfg = {0};
     cfg.port = atoi(env_or("PORT", "8000"));
     if (cfg.port <= 0 || cfg.port > 65535) cfg.port = 8000;
     cfg.db_path = env_or("DATABASE_PATH", "data/ai_question_bank.db");
     cfg.web_root = env_or("WEB_ROOT", "../web");
-    cfg.ai_base_url = env_or("AI_API_BASE_URL", "https://api.openai.com/v1");
-    cfg.ai_api_key = env_or("AI_API_KEY", "");
-    cfg.ai_model = env_or("AI_MODEL", "gpt-4o-mini");
+    cfg.ai_service_url = env_or("AI_SERVICE_URL", "http://127.0.0.1:8001");
+    cfg.ai_service_token = env_or("AI_SERVICE_TOKEN", "");
+    cfg.ai_connect_timeout_ms = timeout_ms("AI_CONNECT_TIMEOUT_MS", AI_CONNECT_TIMEOUT_MS_DEFAULT);
+    cfg.ai_request_timeout_ms = timeout_ms("AI_REQUEST_TIMEOUT_MS", AI_REQUEST_TIMEOUT_MS_DEFAULT);
+    const char *routing=env_or("AI_ROUTING_MODE","teacher");
+    cfg.ai_routing_mode=!strcmp(routing,"platform") ? "platform" : "teacher";
+    if (strcmp(routing,"teacher") && strcmp(routing,"platform")) fprintf(stderr,"[config] invalid AI_ROUTING_MODE; using teacher\n");
+    cfg.ai_key_encryption_key=env_or("AI_KEY_ENCRYPTION_KEY","");
+    const char *limit=env_or("AI_STUDENT_DAILY_LIMIT","20");
+    int valid=1;
+    for (const char *p=limit;*p;p++) if (*p<'0' || *p>'9') valid=0;
+    errno=0; char *limit_end=NULL; long daily=strtol(limit,&limit_end,10);
+    cfg.ai_student_daily_limit=valid && !errno && limit_end && !*limit_end && daily>=1 && daily<=10000 ? (int)daily : 20;
+    if (cfg.ai_student_daily_limit==20 && strcmp(limit,"20")) fprintf(stderr,"[config] AI_STUDENT_DAILY_LIMIT normalized or defaulted\n");
     return cfg;
 }

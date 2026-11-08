@@ -2,16 +2,6 @@
 const QuestionsPage = (() => {
   const $ = (id) => document.getElementById(id);
 
-  /** HTML 转义：题目内容来自后端，拼进 innerHTML 前必须转义，防注入 */
-  function escapeHtml(s) {
-    return String(s)
-      .replace(/&/g, '&amp;')
-      .replace(/</g, '&lt;')
-      .replace(/>/g, '&gt;')
-      .replace(/"/g, '&quot;')
-      .replace(/'/g, '&#39;');
-  }
-
   function show() {
     $('page-login').classList.add('hidden');
     $('navbar').classList.remove('hidden');
@@ -24,12 +14,16 @@ const QuestionsPage = (() => {
   }
 
   async function loadQuestions() {
+    /* 重试时先复位：隐藏错误、清空旧列表、显示加载态 */
+    $('questionsError').classList.add('hidden');
+    $('questionsList').innerHTML = '';
+    $('questionsLoading').classList.remove('hidden');
     try {
       const data = await API.questions();    // { questions: [...] }
       renderQuestions(data.questions || []);
     } catch (e) {
       $('questionsLoading').classList.add('hidden');
-      $('questionsError').textContent = '加载失败：' + (e.message || '未知错误');
+      $('questionsErrorText').textContent = '加载失败：' + (e.message || '未知错误');
       $('questionsError').classList.remove('hidden');
     }
   }
@@ -38,7 +32,7 @@ const QuestionsPage = (() => {
     $('questionsLoading').classList.add('hidden');
     const list = $('questionsList');
     if (questions.length === 0) {
-      list.innerHTML = '<p style="text-align:center;color:#999;">暂无题目</p>';
+      list.innerHTML = '<p class="empty-state">暂无题目</p>';
       return;
     }
     list.innerHTML = questions.map(q => {
@@ -59,5 +53,5 @@ const QuestionsPage = (() => {
     }).join('');
   }
 
-  return { show };
+  return { show, reload: loadQuestions };
 })();
